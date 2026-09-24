@@ -221,6 +221,37 @@ def get_box_temperature_median(
 
 
 @app.get(
+    "/boxes/{box_code}/merkle-proof",
+    tags=["boxes"],
+    response_model=schemas.MerkleProofResult,
+    summary="区间事件的 Merkle 包含证明（按 seq 升序建树，只读不写回）",
+)
+def get_box_merkle_proof(
+    box_code: str,
+    db: DbSession,
+    seq_from: Annotated[int, Query(ge=0, description="起始序号（含）")],
+    seq_to: Annotated[int, Query(ge=0, description="结束序号（含）")],
+    target_seq: Annotated[
+        int, Query(ge=0, description="目标事件序号（须为区间内实际存在的事件）")
+    ],
+) -> schemas.MerkleProofResult:
+    if seq_from > seq_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_range",
+                "message": f"seq_from({seq_from}) 不能大于 seq_to({seq_to})",
+                "seq_from": seq_from,
+                "seq_to": seq_to,
+            },
+        )
+    result = services.merkle_proof(db, box_code.strip(), seq_from, seq_to, target_seq)
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})
+    return result
+
+
+@app.get(
     "/boxes/{box_code}/trajectory-compression",
     tags=["boxes"],
     response_model=schemas.TrajectoryCompressionResult,

@@ -1,4 +1,6 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明。"""
+import hashlib
+import json
 import math
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
@@ -297,6 +299,109 @@ def clock_audit(
         )
         for i, (event, sugg) in enumerate(zip(events, suggested))
     ]
+
+
+def _merkle_leaf(event: models.BoxEvent) -> tuple[str, bytes]:
+    """构造叶子原文并计算叶哈希，返回 (原文, 哈希字节)。
+
+    叶子原文：箱号、序号、UTC 时间字符串（YYYY-MM-DDTHH:MM:SS.ffffffZ）与
+    .17g 温度字符串组成的无空格 JSON 数组；中文等非 ASCII 字符原样保留
+    （ensure_ascii=False），按 UTF-8 编码参与哈希。
+    叶哈希：SHA-256(0x00 || 原文的 UTF-8 字节)。
+    """
+    time_str = event.event_time.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+    temp_str = format(event.temperature, ".17g")
+    leaf_data = json.dumps(
+        [event.box_code, event.seq, time_str, temp_str],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(b"\x00" + leaf_data.encode("utf-8")).digest()
+    return leaf_data, digest
+
+
+def _merkle_root_and_proof(
+    leaf_hashes: list[bytes], target_index: int
+) -> tuple[bytes, list[tuple[bytes, str]]]:
+    """按查询顺序（seq 升序）的叶哈希列表建树，返回 (根哈希, 目标叶的证明路径)。
+
+    父节点哈希 = SHA-256(0x01 || 左哈希 || 右哈希)；某层节点数为奇数时
+    复制末节点再两两配对。证明路径从叶层到根层逐层给出 (兄弟哈希, 兄弟方位)，
+    方位 left/right 表示兄弟在当前节点的左/右；单事件（叶即根）时为空路径。
+    """
+    level = list(leaf_hashes)
+    index = target_index
+    proof: list[tuple[bytes, str]] = []
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])  # 奇数层复制末节点
+        sibling = index ^ 1
+        side = "right" if index % 2 == 0 else "left"
+        proof.append((level[sibling], side))
+        level = [
+            hashlib.sha256(b"\x01" + level[i] + level[i + 1]).digest()
+            for i in range(0, len(level), 2)
+        ]
+        index //= 2
+    return level[0], proof
+
+
+def merkle_proof(
+    db: Session, box_code: str, seq_from: int, seq_to: int, target_seq: int
+) -> schemas.MerkleProofResult | None:
+    """区间事件的 Merkle 包含证明（只读即时计算，不补缺号、不写回）。
+
+    - 取区间 [seq_from, seq_to]（含端点）内按 seq 升序的实际已存事件作为叶子，
+      缺号不补点；目标序号必须对应区间内实际存在的事件
+    - 箱号不存在（从未上报过）返回 None，由路由层转 404
+    - 目标序号不在区间实际事件中（含区间为空）：抛 404（target_not_in_range）
+    """
+    events = _events_in_range(db, box_code, seq_from, seq_to)
+    if events is None:
+        return None
+
+    target_index = next(
+        (i for i, e in enumerate(events) if e.seq == target_seq), None
+    )
+    if target_index is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "target_not_in_range",
+                "message": (
+                    f"箱号 {box_code} 在区间 [{seq_from}, {seq_to}] 内"
+                    f"不存在序号为 {target_seq} 的事件"
+                ),
+                "box_code": box_code,
+                "seq_from": seq_from,
+                "seq_to": seq_to,
+                "target_seq": target_seq,
+            },
+        )
+
+    leaf_data_list: list[str] = []
+    leaf_hashes: list[bytes] = []
+    for event in events:
+        leaf_data, digest = _merkle_leaf(event)
+        leaf_data_list.append(leaf_data)
+        leaf_hashes.append(digest)
+
+    root, proof = _merkle_root_and_proof(leaf_hashes, target_index)
+
+    return schemas.MerkleProofResult(
+        box_code=box_code,
+        seq_from=seq_from,
+        seq_to=seq_to,
+        target_seq=target_seq,
+        event_count=len(events),
+        leaf_data=leaf_data_list[target_index],
+        target_leaf_hash=leaf_hashes[target_index].hex(),
+        root_hash=root.hex(),
+        proof=[
+            schemas.MerkleProofStep(sibling_hash=h.hex(), sibling_side=side)
+            for h, side in proof
+        ],
+    )
 
 
 def _segment_exposure(

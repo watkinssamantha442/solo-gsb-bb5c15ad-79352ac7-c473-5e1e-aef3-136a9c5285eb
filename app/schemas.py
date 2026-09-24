@@ -118,6 +118,44 @@ class HeatExposureResult(BaseModel):
     segments: list[HeatExposureSegment] = Field(..., description="计入积分的逐段明细")
 
 
+class MerkleProofStep(BaseModel):
+    sibling_hash: str = Field(
+        ..., description="该层兄弟节点哈希（SHA-256，64 位小写十六进制）"
+    )
+    sibling_side: str = Field(
+        ...,
+        description=(
+            "兄弟节点相对当前节点的位置：left=兄弟在左"
+            "（父哈希 = SHA-256(0x01 || 兄弟 || 当前)）；"
+            "right=兄弟在右（父哈希 = SHA-256(0x01 || 当前 || 兄弟)）"
+        ),
+    )
+
+
+class MerkleProofResult(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    seq_from: int = Field(..., description="查询起始序号（含）")
+    seq_to: int = Field(..., description="查询结束序号（含）")
+    target_seq: int = Field(..., description="目标事件序号")
+    event_count: int = Field(
+        ..., description="区间内实际事件条数（即 Merkle 树叶子数，缺号不补）"
+    )
+    leaf_data: str = Field(
+        ...,
+        description=(
+            "目标叶子原文：由箱号、序号、UTC 时间字符串（YYYY-MM-DDTHH:MM:SS.ffffffZ）"
+            "与 .17g 温度字符串组成的无空格 JSON 数组（中文等非 ASCII 字符原样 UTF-8 编码）"
+        ),
+    )
+    target_leaf_hash: str = Field(
+        ..., description="目标叶哈希：SHA-256(0x00 || leaf_data 的 UTF-8 字节)，十六进制"
+    )
+    root_hash: str = Field(..., description="Merkle 根哈希（十六进制）")
+    proof: list[MerkleProofStep] = Field(
+        ..., description="从叶层到根层逐层的兄弟哈希与方位；单事件时为空数组"
+    )
+
+
 class TemperatureMedianResult(BaseModel):
     box_code: str = Field(..., description="周转箱箱号")
     seq_from: int = Field(..., description="查询起始序号（含）")
