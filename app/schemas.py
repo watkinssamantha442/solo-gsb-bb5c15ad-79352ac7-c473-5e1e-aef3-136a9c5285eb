@@ -1,5 +1,6 @@
 """Pydantic 请求/响应模型。"""
 from datetime import datetime, timezone
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -51,6 +52,42 @@ class BoxState(BaseModel):
 
 class BoxListItem(BaseModel):
     box_code: str
+
+
+class MerkleProofStep(BaseModel):
+    sibling_hash: str = Field(
+        ..., description="该层兄弟节点哈希（小写十六进制 SHA-256）"
+    )
+    side: Literal["left", "right"] = Field(
+        ...,
+        description=(
+            "兄弟节点相对目标节点的方向：left=兄弟在左，"
+            "调用方重算时计算 hash(node||sibling)；right=兄弟在右，计算 hash(sibling||node)"
+        ),
+    )
+
+
+class MerkleProofResult(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    seq_from: int = Field(..., description="查询起始序号（含）")
+    seq_to: int = Field(..., description="查询结束序号（含）")
+    target_seq: int = Field(..., description="被证明事件的序号")
+    event_count: int = Field(
+        ..., description="区间内实际已存事件条数（缺号不补点）"
+    )
+    root_hash: str = Field(
+        ..., description="区间事件按 seq 升序构造的 Merkle 树根哈希（小写十六进制）"
+    )
+    target_leaf_hash: str = Field(
+        ..., description="目标事件的叶子哈希（小写十六进制）"
+    )
+    proof: list[MerkleProofStep] = Field(
+        ...,
+        description=(
+            "逐层兄弟哈希与左右方向（由叶向根）；单事件证明为空路径，"
+            "此时根哈希即目标叶哈希"
+        ),
+    )
 
 
 class ClockAuditItem(BaseModel):

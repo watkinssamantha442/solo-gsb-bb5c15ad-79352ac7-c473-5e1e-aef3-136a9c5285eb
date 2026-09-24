@@ -1,4 +1,6 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 区间包含证明。"""
+import hashlib
+import json
 import math
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
@@ -643,4 +645,125 @@ def trajectory_compression(
             )
             for i in kept_idx
         ],
+    )
+
+
+def _merkle_time_string(dt: datetime) -> str:
+    """UTC naive datetime -> YYYY-MM-DDTHH:MM:SS.ffffffZ（固定 6 位微秒）。"""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _merkle_leaf_payload(event: models.BoxEvent) -> str:
+    """叶子被哈希的数据：[箱号, 序号, UTC 时间串, .17g 温度串] 的无空格 JSON。
+
+    - 时间用 YYYY-MM-DDTHH:MM:SS.ffffffZ（UTC，固定微秒位）
+    - 温度用 format(x, '.17g')，保证 round-trip 精度且对整数温度不带小数点
+    - json.dumps 指定 separators 去掉所有空格；ensure_ascii=False 让中文原样编码
+      （箱号中的中文不转义为 \\uXXXX）
+    """
+    return json.dumps(
+        [
+            event.box_code,
+            event.seq,
+            _merkle_time_string(event.event_time),
+            format(event.temperature, ".17g"),
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _merkle_leaf_hash(event: models.BoxEvent) -> str:
+    """叶子哈希 SHA-256(0x00 || UTF-8 数据)，返回小写十六进制。"""
+    return hashlib.sha256(
+        b"\x00" + _merkle_leaf_payload(event).encode("utf-8")
+    ).hexdigest()
+
+
+def _merkle_parent_hash(left: str, right: str) -> str:
+    """父节点哈希 SHA-256(0x01 || 左哈希 || 右哈希)，入参为十六进制串。"""
+    return hashlib.sha256(
+        b"\x01" + bytes.fromhex(left) + bytes.fromhex(right)
+    ).hexdigest()
+
+
+def merkle_inclusion_proof(
+    db: Session,
+    box_code: str,
+    seq_from: int,
+    seq_to: int,
+    target_seq: int,
+) -> schemas.MerkleProofResult | None:
+    """对区间内某条已存事件构造 Merkle 包含证明（只读即时计算，不写回任何记录）。
+
+    - 按 seq 升序取闭区间 [seq_from, seq_to] 内实际已存事件，缺号不补点，
+      以这些事件（且仅这些事件）作为叶子构造查询时的 Merkle 树
+    - 叶子：SHA-256(0x00 || UTF-8([箱号,序号,UTC时间串,.17g温度串] 无空格 JSON))
+    - 父节点：SHA-256(0x01 || 左哈希 || 右哈希)；奇数层复制末节点后配对
+    - 返回事件数、根哈希、目标叶哈希及逐层兄弟哈希和左右方向，供调用方重算根；
+      区间内只有目标一条事件时证明为空路径，根哈希即其叶哈希
+    - 箱号不存在（从未上报过）返回 None，由路由层转 404
+    - 目标序号不在区间（[seq_from, seq_to] 之外）或区间内该序号无实际事件：
+      抛 404（target_not_in_range）
+    """
+    events = _events_in_range(db, box_code, seq_from, seq_to)
+    if events is None:
+        return None
+
+    target_idx: int | None = None
+    for i, event in enumerate(events):
+        if event.seq == target_seq:
+            target_idx = i
+            break
+    if target_idx is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "target_not_in_range",
+                "message": (
+                    f"目标序号 {target_seq} 不在区间 [{seq_from}, {seq_to}] 内，"
+                    "或该序号在区间内没有实际事件"
+                ),
+                "box_code": box_code,
+                "seq_from": seq_from,
+                "seq_to": seq_to,
+                "target_seq": target_seq,
+            },
+        )
+
+    # 逐层构造 Merkle 树，同时跟踪目标节点位置并收集兄弟哈希
+    level = [_merkle_leaf_hash(event) for event in events]
+    target_leaf_hash = level[target_idx]
+    idx = target_idx
+    proof: list[schemas.MerkleProofStep] = []
+    while len(level) > 1:
+        # 奇数层：复制末节点，保证目标节点（不在被复制位置之外）都能两两配对
+        if len(level) % 2 == 1:
+            level = [*level, level[-1]]
+        if idx % 2 == 0:
+            # 目标在左，兄弟在右；重算时 node = parent(node, sibling)
+            sibling_hash = level[idx + 1]
+            side = "right"
+        else:
+            # 目标在右，兄弟在左；重算时 node = parent(sibling, node)
+            sibling_hash = level[idx - 1]
+            side = "left"
+        proof.append(
+            schemas.MerkleProofStep(sibling_hash=sibling_hash, side=side)
+        )
+        level = [
+            _merkle_parent_hash(level[i], level[i + 1])
+            for i in range(0, len(level), 2)
+        ]
+        idx //= 2
+
+    return schemas.MerkleProofResult(
+        box_code=box_code,
+        seq_from=seq_from,
+        seq_to=seq_to,
+        target_seq=target_seq,
+        event_count=len(events),
+        root_hash=level[0],
+        target_leaf_hash=target_leaf_hash,
+        proof=proof,
     )

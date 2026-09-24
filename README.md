@@ -19,7 +19,7 @@
 │   ├── database.py        # 引擎/会话，启动建表
 │   ├── models.py          # BoxEvent 模型，(box_code, seq) 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -29,8 +29,23 @@
 
 ## 一键启动（Docker Compose）
 
+单命令构建镜像并后台启动服务（默认对外端口 **8000**）：
+
 ```bash
 docker compose up -d --build
+```
+
+启动后访问：
+
+- 服务地址：<http://localhost:8000>
+- 健康检查：<http://localhost:8000/health>
+- Swagger 交互文档：<http://localhost:8000/docs>
+
+如需改用其他宿主端口（例如 9000）：
+
+```bash
+APP_PORT=9000 docker compose up -d --build
+# 此时访问 http://localhost:9000
 ```
 
 启动过程会自动完成：
@@ -93,6 +108,7 @@ APP_PORT=9000 docker compose up -d --build
 | GET  | `/boxes`                      | 所有上报过的箱号                       |
 | GET  | `/boxes/{box_code}/state`     | 单个箱子的最新状态                     |
 | GET  | `/boxes/{box_code}/events`    | 单个箱子的全部事件（按序号升序）       |
+| GET  | `/boxes/{box_code}/merkle-proof` | 区间事件的 Merkle 包含证明（按 seq 升序即时建树，缺号不补点、只读不写回） |
 | GET  | `/boxes/{box_code}/clock-audit` | 区间事件的设备时钟回拨校正建议（保序回归，不改原始记录） |
 | GET  | `/boxes/{box_code}/heat-exposure` | 区间事件的超温积分（℃·秒，线性插值 + 保序校正时间，不改原始记录） |
 | GET  | `/boxes/{box_code}/temperature-median` | 区间按持续时间加权的温度中位数（线性插值 + 保序校正时间，不改原始记录） |
@@ -153,6 +169,139 @@ curl -X POST http://localhost:8000/events \
 # 乱序补报 seq=0 / seq=2 ... 最新状态始终取最大 seq
 curl http://localhost:8000/boxes/BOX-001/state
 curl http://localhost:8000/states
+```
+
+## 区间事件 Merkle 包含证明（merkle-proof）
+
+`GET /boxes/{box_code}/merkle-proof?seq_from=&seq_to=&target_seq=`（默认访问端口 **8000**）
+对指定序号区间内**实际已存**的事件按 `seq` 升序**在查询时即时构造一棵 Merkle 树**，
+返回某条目标事件的包含证明。**缺号不补点、不写回任何数据**；树只由区间内实际存在的事件构成。
+
+哈希规则：
+
+- **叶子数据**：把以下四个值组成 JSON 数组（**无空格**；箱号中的中文用 `ensure_ascii=False`
+  原样编码，不转义成 `\uXXXX`）：
+  1. 箱号（字符串）
+  2. 序号（整数）
+  3. UTC 事件时间字符串，格式固定为 `YYYY-MM-DDTHH:MM:SS.ffffffZ`（6 位微秒）
+  4. 温度字符串，用 `format(temperature, ".17g")` 表示（最短 round-trip 精度）
+
+  例如：`["BOX-MRK",3,"2026-09-23T02:03:00.000000Z","-5.0999999999999996"]`
+- **叶子哈希**：`SHA-256(0x00 || UTF-8(叶子数据))`（`0x00` 为 1 字节域分离前缀）。
+- **父节点哈希**：`SHA-256(0x01 || 左哈希 || 右哈希)`（哈希按原始 32 字节拼接）；
+  某层节点数为奇数时**复制末节点**后两两配对。
+
+查询参数：
+
+- `seq_from` / `seq_to`：序号区间，**均为整数且含端点**，必须 `>= 0` 且 `seq_from <= seq_to`。
+- `target_seq`：被证明事件的序号，非负整数；必须在 `[seq_from, seq_to]` 内且该序号实际存在。
+
+返回字段：
+
+| 字段               | 说明                                                          |
+| ------------------ | ------------------------------------------------------------- |
+| `event_count`      | 区间内实际已存事件条数（缺号不补点，即叶子数）                |
+| `root_hash`        | Merkle 树根哈希（小写十六进制 SHA-256）                       |
+| `target_leaf_hash` | 目标事件的叶子哈希（小写十六进制）                            |
+| `proof[]`          | 由叶向根的逐层兄弟节点；单事件证明为**空路径**，此时根即叶哈希 |
+
+`proof[]` 每步包含：
+
+- `sibling_hash`：该层兄弟节点哈希（小写十六进制）。
+- `side`：兄弟相对目标的方向。`"right"` 表示兄弟在右，重算父节点用
+  `SHA256(0x01‖node‖sibling)`；`"left"` 表示兄弟在左，重算用
+  `SHA256(0x01‖sibling‖node)`。从 `target_leaf_hash` 出发逐层计算，最终必等于 `root_hash`。
+
+错误情况：箱号不存在返回 `404`（`box_not_found`）；目标序号不在区间内、或区间内该序号
+没有实际事件（缺号）返回 `404`（`target_not_in_range`）；`seq_from > seq_to`、参数缺失、
+负数或非整数返回 `422`。
+
+```bash
+# 先上报 4 条事件（seq=2 缺号，缺号不补点）
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-MRK","seq":0,"temperature":-4.5,"event_time":"2026-09-23T02:00:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-MRK","seq":1,"temperature":-4.7,"event_time":"2026-09-23T02:01:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-MRK","seq":3,"temperature":-5.1,"event_time":"2026-09-23T02:03:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-MRK","seq":4,"temperature":-4.9,"event_time":"2026-09-23T02:04:00+00:00"}'
+
+# 证明 seq=3 包含于区间 [0,4]（树由 seq 0/1/3/4 四个叶子构成）
+curl 'http://localhost:8000/boxes/BOX-MRK/merkle-proof?seq_from=0&seq_to=4&target_seq=3'
+```
+
+响应：
+
+```json
+{
+  "box_code": "BOX-MRK",
+  "seq_from": 0,
+  "seq_to": 4,
+  "target_seq": 3,
+  "event_count": 4,
+  "root_hash": "031271f63fca74ecebd94198852bd6a841f75f3d2e23662aaa43af69b9a3c176",
+  "target_leaf_hash": "5dd128bfb77782bc8961f7991fb5cd4060a4feaf472cc9723a15273516a6020f",
+  "proof": [
+    {"sibling_hash": "0c1a0d782fe502dbb717298e44b6f8f1fb51334084b2bf521ac7096a9820aa44", "side": "right"},
+    {"sibling_hash": "e7bc7ba83598b23b8612c111c67af5d6a515ca25c440bee84a94ab09cfd4bcb6", "side": "left"}
+  ]
+}
+```
+
+调用方可用任意语言重算根（Python 示例）：
+
+```bash
+python3 - <<'PY'
+import hashlib, json
+
+root_hash   = "031271f63fca74ecebd94198852bd6a841f75f3d2e23662aaa43af69b9a3c176"
+node        = "5dd128bfb77782bc8961f7991fb5cd4060a4feaf472cc9723a15273516a6020f"
+proof = [
+    ("0c1a0d782fe502dbb717298e44b6f8f1fb51334084b2bf521ac7096a9820aa44", "right"),
+    ("e7bc7ba83598b23b8612c111c67af5d6a515ca25c440bee84a94ab09cfd4bcb6", "left"),
+]
+
+def parent(left, right):
+    return hashlib.sha256(b"\x01" + bytes.fromhex(left) + bytes.fromhex(right)).hexdigest()
+
+for sibling, side in proof:
+    node = parent(node, sibling) if side == "right" else parent(sibling, node)
+
+print("recomputed:", node)
+assert node == root_hash, "证明校验失败"
+print("证明有效：目标事件包含于该区间树根")
+PY
+```
+
+也可以直接核对目标叶子哈希（叶子数据即无空格 JSON 数组，温度用 `.17g`）：
+
+```bash
+python3 - <<'PY'
+import hashlib, json
+data = json.dumps(
+    ["BOX-MRK", 3, "2026-09-23T02:03:00.000000Z", format(-5.1, ".17g")],
+    ensure_ascii=False, separators=(",", ":"),
+)
+print(data)  # ["BOX-MRK",3,"2026-09-23T02:03:00.000000Z","-5.0999999999999996"]
+print(hashlib.sha256(b"\x00" + data.encode("utf-8")).hexdigest())
+# 5dd128bfb77782bc8961f7991fb5cd4060a4feaf472cc9723a15273516a6020f
+PY
+```
+
+```bash
+# 区间内只有目标一条事件 -> 空路径，root_hash == target_leaf_hash
+curl 'http://localhost:8000/boxes/BOX-MRK/merkle-proof?seq_from=2&seq_to=3&target_seq=3'
+
+# 目标不在区间 / 区间内该序号缺号 -> 404 target_not_in_range
+curl -i 'http://localhost:8000/boxes/BOX-MRK/merkle-proof?seq_from=0&seq_to=4&target_seq=9'
+curl -i 'http://localhost:8000/boxes/BOX-MRK/merkle-proof?seq_from=0&seq_to=4&target_seq=2'
+
+# 箱号不存在 -> 404 box_not_found
+curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/merkle-proof?seq_from=0&seq_to=1&target_seq=0'
+
+# 非法区间（seq_from > seq_to）-> 422
+curl -i 'http://localhost:8000/boxes/BOX-MRK/merkle-proof?seq_from=5&seq_to=2&target_seq=3'
 ```
 
 ## 时钟回拨校正（clock-audit）
@@ -580,6 +729,14 @@ curl -i 'http://localhost:8000/boxes/BOX-CMP/trajectory-compression?seq_from=0&s
   误差比较用 `Fraction` 精确计算（float 温度与整数序号均可无损转为有理数），
   避免浮点误差在 `max_error` 边界上误判；单次限 120 条，O(n³) 开销可控。
   预览不写库，乱序补报后重查即自动重算。
+- **区间 Merkle 包含证明只读**：`merkle-proof` 复用区间事件读取（按 `seq` 升序、
+  含端点、缺号不补点），在查询时即时用这些实际事件构造 Merkle 树，不写库、不缓存，
+  乱序补报后重查即自动重算。叶子先把 `[箱号, 序号, UTC 时间串, .17g 温度串]`
+  序列化为**无空格** JSON（中文 `ensure_ascii=False` 原样编码），再计算
+  `SHA-256(0x00‖UTF-8 数据)`；父节点计算 `SHA-256(0x01‖左哈希‖右哈希)`，
+  奇数层复制末节点后配对——`0x00/0x01` 前缀做域分离，避免叶子/内部节点哈希混淆。
+  返回根哈希、目标叶哈希与逐层兄弟哈希及左右方向，调用方仅凭证明即可重算根；
+  区间内仅一条事件时证明为空路径（根即叶哈希）。
 - **持久化**：默认 SQLite + WAL，卷挂载于 `/app/data`；
   如需 PostgreSQL/MySQL，只需将 `DATABASE_URL` 换成对应 SQLAlchemy 连接串
   （并安装相应驱动），建表逻辑通用。
